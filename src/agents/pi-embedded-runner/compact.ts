@@ -409,6 +409,9 @@ export async function compactEmbeddedPiSessionDirect(
       // loads event-handler extensions (e.g. compaction-rolling).
       let resourceLoader: DefaultResourceLoader | undefined;
       if (extensionPaths.length > 0) {
+        log.info(
+          `[compact] Loading ${extensionPaths.length} extension(s): ${extensionPaths.join(", ")}`,
+        );
         resourceLoader = new DefaultResourceLoader({
           cwd: effectiveWorkspace,
           agentDir,
@@ -416,6 +419,19 @@ export async function compactEmbeddedPiSessionDirect(
           additionalExtensionPaths: extensionPaths,
         });
         await resourceLoader.reload();
+        const extResult = resourceLoader.getExtensions();
+        log.info(
+          `[compact] Extensions loaded: ${extResult.extensions.length} ok, ${extResult.errors.length} errors` +
+            (extResult.errors.length > 0
+              ? `. Errors: ${extResult.errors.map((e) => `${e.path}: ${e.error}`).join("; ")}`
+              : ""),
+        );
+        for (const ext of extResult.extensions) {
+          const handlers = [...ext.handlers.keys()];
+          log.info(`[compact] Extension ${ext.path}: handlers=[${handlers.join(",")}]`);
+        }
+      } else {
+        log.info("[compact] No extension paths returned from buildEmbeddedExtensionPaths");
       }
 
       const { session } = await createAgentSession({
@@ -469,6 +485,14 @@ export async function compactEmbeddedPiSessionDirect(
         // does rolling eviction and persists via appendCompaction().
         // This works for both proactive SDK compaction and overflow fallback.
 
+        // Debug: check if extension runner is wired up
+        const extRunner = (session as any)._extensionRunner;
+        log.info(`[compact] session._extensionRunner exists: ${!!extRunner}`);
+        if (extRunner) {
+          log.info(
+            `[compact] hasHandlers("session_before_compact"): ${extRunner.hasHandlers("session_before_compact")}`,
+          );
+        }
         const result = await session.compact(params.customInstructions);
         // Estimate tokens after compaction by summing token estimates for remaining messages
         let tokensAfter: number | undefined;

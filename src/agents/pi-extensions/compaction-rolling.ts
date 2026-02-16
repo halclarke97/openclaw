@@ -2,153 +2,101 @@
  * Rolling context eviction extension.
  *
  * Intercepts the SDK's `session_before_compact` event and replaces the default
- * LLM-generated summary with a minimal eviction note.  The old messages are
- * still persisted in the session JSONL and remain searchable via memory_search;
- * we simply don't spend tokens summarizing them.
+ * LLM-generated summary with a simple eviction note. Instead of using the SDK's
+ * aggressive cut point (~20k tokens kept), this extension computes its own cut
+ * point that keeps ~50% of context, dropping only the oldest messages.
+ *
+ * The old messages are still persisted in the session JSONL and remain
+ * searchable via memory_search; we simply don't spend tokens summarizing them.
  */
-import type { AgentMessage } from "@mariozechner/pi-agent-core";
-import {
-  estimateTokens,
-  findCutPoint,
-  type ExtensionAPI,
-  type FileOperations,
-  type SessionEntry,
-} from "@mariozechner/pi-coding-agent";
+import type { ExtensionAPI, FileOperations } from "@mariozechner/pi-coding-agent";
 
+/** Target: keep this fraction of tokensBefore after compaction */
 const KEEP_RATIO = 0.5;
-const MIN_DROP_TOKENS = 1024;
 
-type RollingCut = {
-  firstKeptEntryId: string;
-  firstKeptIndex: number;
-  droppedTokens: number;
-  droppedMessages: AgentMessage[];
-};
+/** Minimum tokens to drop — don't bother compacting if we'd drop less than this */
+const MIN_DROP_TOKENS = 5000;
 
-function createFileOps(): FileOperations {
-  return {
-    read: new Set(),
-    written: new Set(),
-    edited: new Set(),
+interface SessionEntry {
+  type: string;
+  id: string;
+  message?: {
+    role: string;
+    content?: unknown;
   };
+  summary?: string;
 }
 
-function isMessageEntry(entry: SessionEntry): entry is Extract<SessionEntry, { type: "message" }> {
-  return entry.type === "message";
-}
-
+/**
+ * Rough token estimate matching the SDK's estimateTokens logic (chars/4).
+ */
 function estimateEntryTokens(entry: SessionEntry): number {
-  if (!isMessageEntry(entry)) {
+  if (entry.type !== "message" || !entry.message) {
     return 0;
   }
-  return estimateTokens(entry.message);
-}
+  const msg = entry.message;
+  let chars = 0;
 
-function estimateBoundaryTokens(entries: SessionEntry[], start: number, end: number): number {
-  let tokens = 0;
-  for (let i = start; i < end; i++) {
-    tokens += estimateEntryTokens(entries[i]);
-  }
-  return tokens;
-}
-
-function collectDroppedMessages(
-  entries: SessionEntry[],
-  start: number,
-  end: number,
-): AgentMessage[] {
-  const messages: AgentMessage[] = [];
-  for (let i = start; i < end; i++) {
-    const entry = entries[i];
-    if (isMessageEntry(entry)) {
-      messages.push(entry.message);
+  if (msg.role === "user") {
+    const content = msg.content;
+    if (typeof content === "string") {
+      chars = content.length;
+    } else if (Array.isArray(content)) {
+      for (const block of content as Array<{ type: string; text?: string }>) {
+        if (block.type === "text" && block.text) {
+          chars += block.text.length;
+        }
+      }
+    }
+  } else if (msg.role === "assistant") {
+    const content = (msg as any).content;
+    if (Array.isArray(content)) {
+      for (const block of content) {
+        if (block.type === "text") {
+          chars += (block.text || "").length;
+        } else if (block.type === "thinking") {
+          chars += (block.thinking || "").length;
+        } else if (block.type === "toolCall") {
+          chars += (block.name || "").length + JSON.stringify(block.arguments || {}).length;
+        }
+      }
+    }
+  } else if (msg.role === "toolResult") {
+    const content = (msg as any).content;
+    if (typeof content === "string") {
+      chars = content.length;
+    } else if (Array.isArray(content)) {
+      for (const block of content as Array<{ type: string; text?: string }>) {
+        if (block.type === "text" && block.text) {
+          chars += block.text.length;
+        }
+      }
     }
   }
-  return messages;
+
+  return Math.ceil(chars / 4);
 }
 
-function findBoundaryStartIndex(entries: SessionEntry[]): number {
-  for (let i = entries.length - 1; i >= 0; i--) {
-    if (entries[i].type === "compaction") {
-      return i + 1;
-    }
+/**
+ * Check if an entry is a valid cut point (same logic as SDK's findValidCutPoints).
+ * We can cut at user/assistant messages but NOT at toolResult (would orphan it).
+ */
+function isValidCutPoint(entry: SessionEntry): boolean {
+  if (entry.type === "branch_summary" || entry.type === "custom_message") {
+    return true;
   }
-  return 0;
-}
-
-function resolveRollingCut(entries: SessionEntry[]): RollingCut | null {
-  if (entries.length === 0) {
-    return null;
+  if (entry.type !== "message" || !entry.message) {
+    return false;
   }
-
-  const boundaryStart = findBoundaryStartIndex(entries);
-  const boundaryEnd = entries.length;
-  if (boundaryStart >= boundaryEnd) {
-    return null;
-  }
-
-  const boundaryTokens = estimateBoundaryTokens(entries, boundaryStart, boundaryEnd);
-  if (boundaryTokens <= 0) {
-    return null;
-  }
-
-  const keepRecentTokens = Math.max(1, Math.floor(boundaryTokens * KEEP_RATIO));
-  const cutPoint = findCutPoint(entries, boundaryStart, boundaryEnd, keepRecentTokens);
-  let firstKeptIndex = cutPoint.firstKeptEntryIndex;
-
-  // Rolling mode does not summarize split-turn prefixes, so keep full turns.
-  if (cutPoint.isSplitTurn && cutPoint.turnStartIndex >= boundaryStart) {
-    firstKeptIndex = cutPoint.turnStartIndex;
-  }
-
-  if (firstKeptIndex <= boundaryStart || firstKeptIndex >= boundaryEnd) {
-    return null;
-  }
-
-  const firstKeptEntryId = entries[firstKeptIndex]?.id;
-  if (typeof firstKeptEntryId !== "string" || firstKeptEntryId.length === 0) {
-    return null;
-  }
-
-  const droppedTokens = estimateBoundaryTokens(entries, boundaryStart, firstKeptIndex);
-  if (droppedTokens < MIN_DROP_TOKENS) {
-    return null;
-  }
-
-  const droppedMessages = collectDroppedMessages(entries, boundaryStart, firstKeptIndex);
-  if (droppedMessages.length === 0) {
-    return null;
-  }
-
-  return {
-    firstKeptEntryId,
-    firstKeptIndex,
-    droppedTokens,
-    droppedMessages,
-  };
-}
-
-function extractFileOpsFromMessage(message: AgentMessage, fileOps: FileOperations): void {
-  if (message.role !== "assistant" || !Array.isArray(message.content)) {
-    return;
-  }
-  for (const block of message.content) {
-    if (!block || typeof block !== "object" || block.type !== "toolCall") {
-      continue;
-    }
-    const args = block.arguments as Record<string, unknown>;
-    const path = typeof args.path === "string" ? args.path : undefined;
-    if (!path) {
-      continue;
-    }
-    if (block.name === "read") {
-      fileOps.read.add(path);
-    } else if (block.name === "write") {
-      fileOps.written.add(path);
-    } else if (block.name === "edit") {
-      fileOps.edited.add(path);
-    }
-  }
+  const role = entry.message.role;
+  return (
+    role === "user" ||
+    role === "assistant" ||
+    role === "bashExecution" ||
+    role === "custom" ||
+    role === "branchSummary" ||
+    role === "compactionSummary"
+  );
 }
 
 function computeFileLists(fileOps: FileOperations): {
@@ -174,20 +122,92 @@ function formatFileOperations(readFiles: string[], modifiedFiles: string[]): str
 
 export default function compactionRollingExtension(api: ExtensionAPI): void {
   api.on("session_before_compact", async (event) => {
-    const rollingCut = resolveRollingCut(event.branchEntries);
-    if (!rollingCut) {
+    const { preparation, branchEntries } = event;
+    const { readFiles, modifiedFiles } = computeFileLists(preparation.fileOps);
+    const fileOpsSummary = formatFileOperations(readFiles, modifiedFiles);
+    const tokensBefore = preparation.tokensBefore;
+
+    // Find the boundary: start after the last compaction entry
+    let boundaryStart = 0;
+    for (let i = branchEntries.length - 1; i >= 0; i--) {
+      if (branchEntries[i].type === "compaction") {
+        boundaryStart = i + 1;
+        break;
+      }
+    }
+
+    // Calculate how many tokens to keep
+    const keepTokens = Math.floor(tokensBefore * KEEP_RATIO);
+    const dropTarget = tokensBefore - keepTokens;
+
+    if (dropTarget < MIN_DROP_TOKENS) {
+      // Not worth compacting — cancel
       return { cancel: true };
     }
 
-    const fileOps = createFileOps();
-    for (const message of rollingCut.droppedMessages) {
-      extractFileOpsFromMessage(message, fileOps);
+    // Walk backwards from newest, accumulating tokens to find our cut point.
+    // We want to KEEP ~keepTokens of the newest messages.
+    let accumulatedTokens = 0;
+    let cutIndex = boundaryStart; // Default: drop everything (fallback)
+    let foundCut = false;
+
+    for (let i = branchEntries.length - 1; i >= boundaryStart; i--) {
+      const entry = branchEntries[i] as SessionEntry;
+      const entryTokens = estimateEntryTokens(entry);
+      accumulatedTokens += entryTokens;
+
+      if (accumulatedTokens >= keepTokens) {
+        // We've accumulated enough to keep. Find nearest valid cut point at or after i.
+        for (let c = i; c < branchEntries.length; c++) {
+          if (isValidCutPoint(branchEntries[c] as SessionEntry)) {
+            cutIndex = c;
+            foundCut = true;
+            break;
+          }
+        }
+        break;
+      }
     }
-    const { readFiles, modifiedFiles } = computeFileLists(fileOps);
-    const fileOpsSummary = formatFileOperations(readFiles, modifiedFiles);
+
+    // If we couldn't find a good cut point, or we'd keep everything, use SDK's plan
+    if (!foundCut || cutIndex <= boundaryStart) {
+      // Fall through to SDK's default cut point
+      const evictedCount = preparation.messagesToSummarize.length;
+      const note =
+        `[Rolling eviction: ${evictedCount} messages dropped from context. ` +
+        `Old messages remain in session JSONL and are searchable via memory_search. ` +
+        `Use memory_search to recall prior conversation content.]` +
+        fileOpsSummary;
+
+      return {
+        compaction: {
+          summary: note,
+          firstKeptEntryId: preparation.firstKeptEntryId,
+          tokensBefore: preparation.tokensBefore,
+          details: { readFiles, modifiedFiles },
+        },
+      };
+    }
+
+    const firstKeptEntry = branchEntries[cutIndex] as SessionEntry;
+    const firstKeptEntryId = firstKeptEntry.id;
+
+    // Count how many message entries we're dropping
+    let droppedMessages = 0;
+    for (let i = boundaryStart; i < cutIndex; i++) {
+      if ((branchEntries[i] as SessionEntry).type === "message") {
+        droppedMessages++;
+      }
+    }
+
+    // Estimate tokens being dropped
+    let droppedTokens = 0;
+    for (let i = boundaryStart; i < cutIndex; i++) {
+      droppedTokens += estimateEntryTokens(branchEntries[i] as SessionEntry);
+    }
 
     const note =
-      `[Rolling eviction: ${rollingCut.droppedMessages.length} messages dropped (~${rollingCut.droppedTokens} tokens). ` +
+      `[Rolling eviction: ${droppedMessages} messages dropped from context. ` +
       `Old messages remain in session JSONL and are searchable via memory_search. ` +
       `Use memory_search to recall prior conversation content.]` +
       fileOpsSummary;
@@ -195,22 +215,16 @@ export default function compactionRollingExtension(api: ExtensionAPI): void {
     return {
       compaction: {
         summary: note,
-        firstKeptEntryId: rollingCut.firstKeptEntryId,
-        tokensBefore: event.preparation.tokensBefore,
-        details: { readFiles, modifiedFiles },
+        firstKeptEntryId,
+        tokensBefore,
+        details: {
+          readFiles,
+          modifiedFiles,
+          droppedMessages,
+          droppedTokens,
+          keptTokensEstimate: tokensBefore - droppedTokens,
+        },
       },
     };
   });
 }
-
-export const __testing = {
-  KEEP_RATIO,
-  MIN_DROP_TOKENS,
-  estimateEntryTokens,
-  estimateBoundaryTokens,
-  findBoundaryStartIndex,
-  resolveRollingCut,
-  extractFileOpsFromMessage,
-  computeFileLists,
-  formatFileOperations,
-} as const;
